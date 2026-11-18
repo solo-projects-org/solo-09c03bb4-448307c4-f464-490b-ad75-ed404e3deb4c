@@ -16,8 +16,9 @@ Publication protocol
    and retry, so an old recompute can never overwrite a newer revision.
 3. Every date in a job is published in the same transaction.  Because jobs
    cover adjacent dates together (uploads enqueue all affected dates and
-   merge adjacent pending jobs), cross-midnight pairs and the two dates they
-   touch become current together — never half-published.
+   merge adjacent pending jobs) and the publication set is closed
+   transitively over cross-midnight journeys, the whole chain of dates
+   linked by overnight trips becomes current together — never half-published.
 4. Any failure leaves the dates ``stale`` with the error recorded.  On
    startup ``recover`` re-queues interrupted jobs, re-queues stale dates that
    lost their job, and demotes any ``current`` date whose epoch is behind.
@@ -341,10 +342,11 @@ def _run_job(
     try:
         with db.snapshot(conn):
             journeys, pending = derive(load_latest_events(conn))
-            # Dates linked by a cross-midnight journey must become current in
-            # the same transaction.  If an operation-linked pair spans the job
-            # window (e.g. a targeted repair of only one side), widen the
-            # publication set to include the partner date.
+            # Dates linked by cross-midnight journeys must become current in
+            # the same transaction.  If the linked chain spans beyond the job
+            # window (e.g. a targeted repair of only one end), widen the
+            # publication set to include every transitively linked date, so
+            # this job can never publish a chain only part-way.
             publish_days = _linked_days(days, journeys)
             publish_set = set(publish_days)
             for day in publish_days:
@@ -369,12 +371,27 @@ def _run_job(
 
 
 def _linked_days(days: Iterable[str], journeys: list[Journey]) -> list[str]:
-    """Close the day set over journeys whose two ends fall on different days."""
-    result = set(days)
+    """Close the day set over journeys whose two ends fall on different days.
+
+    The closure is transitive: if one journey links day1→day2 and another
+    links day2→day3, all three dates share midnight context and must become
+    current in the same transaction.  A single pass over ``journeys`` is not
+    enough — whether a chain is fully linked would then depend on the order
+    journeys happen to be derived in, and a targeted recompute of one end
+    could publish the middle of a chain without its far side.
+    """
+    partners: dict[str, set[str]] = {}
     for journey in journeys:
-        if journey.service_date in result or journey.exit_date in result:
-            result.add(journey.service_date)
-            result.add(journey.exit_date)
+        partners.setdefault(journey.service_date, set()).add(journey.exit_date)
+        partners.setdefault(journey.exit_date, set()).add(journey.service_date)
+    result = set(days)
+    stack = list(result)
+    while stack:
+        day = stack.pop()
+        for other in partners.get(day, ()):
+            if other not in result:
+                result.add(other)
+                stack.append(other)
     return sorted(result)
 
 

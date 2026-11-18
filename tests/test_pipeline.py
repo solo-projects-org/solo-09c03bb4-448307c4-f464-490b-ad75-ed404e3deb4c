@@ -1,6 +1,7 @@
 """End-to-end pipeline behaviour: invalidation, publication, correction, recovery."""
 
 from app import db, service
+from app.journeys import Journey
 
 from helpers import day, make_csv, pairs, state, tap, upload
 
@@ -249,3 +250,166 @@ def test_two_day_upload_and_span_validation(db_path):
     ])
     assert pairs(day(db_path, "2024-05-01")) == {("A", "B"): 1}
     assert pairs(day(db_path, "2024-05-02")) == {("C", "D"): 1}
+
+
+# ---------------------------------------------------------------------------
+# cross-midnight chains: day1 -> day2 -> day3 must publish as one unit
+# ---------------------------------------------------------------------------
+
+def _seed_chain(db_path):
+    """Two cards chaining across midnight: cA day1→day2, cB day2→day3.
+
+    cB's event numbers sort before cA's, so cB's journey is derived first
+    (events come back in event_no index order) — the adverse order under
+    which a single-pass linkage would drop day 3 from a day-1 recompute.
+    """
+    upload(db_path, [
+        tap("e1", "cB", "2024-05-02T23:50:00Z", "C", "in"),
+        tap("e2", "cB", "2024-05-03T00:20:00Z", "D", "out"),
+    ])
+    upload(db_path, [
+        tap("e3", "cA", "2024-05-01T23:50:00Z", "A", "in"),
+        tap("e4", "cA", "2024-05-02T00:20:00Z", "B", "out"),
+    ])
+    # An unrelated date with no cross-day link: must keep serving throughout.
+    upload(db_path, [
+        tap("x1", "cX", "2024-05-10T08:00:00Z", "G", "in"),
+        tap("x2", "cX", "2024-05-10T08:30:00Z", "H", "out"),
+    ])
+
+
+def _correct_day3_exit_during_first_compute(stage, conn, info, fired, db_path):
+    if stage == "after_compute" and not fired:
+        fired.append(info["job_id"])
+        # While the old job computes, the day-3 exit receives a higher revision.
+        service.accept_upload(db_path, "fix.csv", make_csv([
+            tap("e2", "cB", "2024-05-03T00:20:00Z", "E", "out", revision=1),
+        ]))
+
+
+def test_linked_days_closure_is_transitive():
+    journeys = [
+        Journey("cB", "e1", "e2", "2024-05-02", "2024-05-03", "C", "D"),
+        Journey("cA", "e3", "e4", "2024-05-01", "2024-05-02", "A", "B"),
+    ]
+    whole = ["2024-05-01", "2024-05-02", "2024-05-03"]
+    # Reachable from either end and from the middle, regardless of order.
+    assert service._linked_days(["2024-05-01"], journeys) == whole
+    assert service._linked_days(["2024-05-03"], journeys) == whole
+    assert service._linked_days(["2024-05-02"], journeys) == whole
+    assert service._linked_days(["2024-05-01"], list(reversed(journeys))) == whole
+    # A journey fully inside an unrelated day is not pulled in.
+    journeys.append(Journey("cZ", "z1", "z2", "2024-05-10", "2024-05-10", "G", "H"))
+    assert service._linked_days(["2024-05-01"], journeys) == whole
+    assert service._linked_days(["2024-05-10"], journeys) == ["2024-05-10"]
+
+
+def test_correction_during_targeted_recompute_publishes_whole_chain(db_path):
+    _seed_chain(db_path)
+    untouched = state(db_path, "2024-05-10")["computed_at"]
+
+    # Auditor asks for a manual recompute of day 1 only.
+    service.request_recompute(db_path, ["2024-05-01"])
+
+    fired = []
+    published = []
+
+    def hook(stage, conn, info):
+        _correct_day3_exit_during_first_compute(stage, conn, info, fired, db_path)
+        if stage == "after_publish":
+            published.append(set(info["days"]))
+
+    service.run_pending_jobs(db_path, hook=hook)
+    assert len(fired) == 1
+    service.run_pending_jobs(db_path)
+
+    # No transaction may publish only a part of the chain: every publish
+    # touching day 1..3 must cover all three dates at once.
+    chain = {"2024-05-01", "2024-05-02", "2024-05-03"}
+    for days_published in published:
+        if days_published & chain:
+            assert chain <= days_published
+    d1, d2, d3 = (day(db_path, d) for d in ("2024-05-01", "2024-05-02", "2024-05-03"))
+    assert d1["status"] == d2["status"] == d3["status"] == "current"
+    assert pairs(d1) == {("A", "B"): 1}
+    assert pairs(d2) == {("C", "E"): 1}
+    assert d3["trip_total"] == 0
+    # The unrelated date was never invalidated or republished.
+    assert state(db_path, "2024-05-10")["status"] == "current"
+    assert state(db_path, "2024-05-10")["computed_at"] == untouched
+
+
+def test_chain_not_half_published_when_followup_job_fails(db_path, monkeypatch):
+    _seed_chain(db_path)
+    service.request_recompute(db_path, ["2024-05-01"])
+
+    fired = []
+    original = service._publish
+    publishes = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        publishes["n"] += 1
+        if publishes["n"] > 1:
+            raise RuntimeError("disk full")  # the correction's own job fails
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(service, "_publish", flaky)
+    service.run_pending_jobs(db_path, hook=lambda stage, conn, info: _correct_day3_exit_during_first_compute(
+        stage, conn, info, fired, db_path))
+
+    # The retried old job had to publish the entire chain from the snapshot
+    # that includes the correction — it must not publish only a part and
+    # leave day 3 behind while the follow-up job is failed.
+    d1, d2, d3 = (day(db_path, d) for d in ("2024-05-01", "2024-05-02", "2024-05-03"))
+    assert d1["status"] == d2["status"] == d3["status"] == "current"
+    assert pairs(d1) == {("A", "B"): 1}
+    assert pairs(d2) == {("C", "E"): 1}
+    assert d3["trip_total"] == 0
+
+
+def test_restart_recovery_keeps_chain_stale_then_publishes_together(db_path):
+    _seed_chain(db_path)
+    untouched = state(db_path, "2024-05-10")["computed_at"]
+
+    job_id = service.request_recompute(db_path, ["2024-05-01"])
+    # The manual job is claimed by a worker...
+    conn = db.connect(db_path)
+    try:
+        conn.execute(
+            "UPDATE recompute_jobs SET status='running', started_at=?, attempts=1 WHERE id=?",
+            (service.utcnow(), job_id),
+        )
+    finally:
+        conn.close()
+    # ...when the day-3 correction lands (it cannot merge into a running
+    # job, so it gets its own job), and the service crashes before publish.
+    accepted = service.accept_upload(db_path, "fix.csv", make_csv([
+        tap("e2", "cB", "2024-05-03T00:20:00Z", "E", "out", revision=1),
+    ]))
+    assert set(accepted.affected_days) == {"2024-05-02", "2024-05-03"}
+
+    service.recover(db_path)
+
+    # The stale state survives the restart: nothing linked is served as current.
+    for d in ("2024-05-01", "2024-05-02", "2024-05-03"):
+        assert state(db_path, d)["status"] == "stale"
+    assert state(db_path, "2024-05-10")["status"] == "current"
+
+    published = []
+
+    def hook(stage, conn, info):
+        if stage == "after_publish":
+            published.append(set(info["days"]))
+
+    service.run_pending_jobs(db_path, hook=hook)
+    # Recovery published the chain as one unit, never piecemeal.
+    chain = {"2024-05-01", "2024-05-02", "2024-05-03"}
+    for days_published in published:
+        if days_published & chain:
+            assert chain <= days_published
+    d1, d2, d3 = (day(db_path, d) for d in ("2024-05-01", "2024-05-02", "2024-05-03"))
+    assert d1["status"] == d2["status"] == d3["status"] == "current"
+    assert pairs(d1) == {("A", "B"): 1}
+    assert pairs(d2) == {("C", "E"): 1}
+    assert d3["trip_total"] == 0
+    assert state(db_path, "2024-05-10")["computed_at"] == untouched
